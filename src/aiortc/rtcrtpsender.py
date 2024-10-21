@@ -45,6 +45,18 @@ logger = logging.getLogger(__name__)
 RTT_ALPHA = 0.85
 
 
+from typing import List, Tuple
+from abc import abstractmethod
+
+class EncodedMediaStreamTrack(MediaStreamTrack):
+    """
+    A MediaStreamTrack subclass that directly provides encoded frames.
+    The recv method should return a list of byte arrays and a timestamp.
+    """
+    @abstractmethod
+    async def recv(self) -> Tuple[List[bytes], int]:
+        pass
+
 class RTCEncodedFrame:
     def __init__(self, payloads: List[bytes], timestamp: int, audio_level: int):
         self.payloads = payloads
@@ -104,7 +116,7 @@ class RTCRtpSender:
         self.__rtp_timestamp = 0
         self.__octet_count = 0
         self.__packet_count = 0
-        self.__rtt: Optional[float] = None
+        self.__rtt = None
 
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
@@ -206,7 +218,7 @@ class RTCRtpSender:
             self.__rtcp_task = asyncio.ensure_future(self._run_rtcp())
             self.__started = True
 
-    async def stop(self) -> None:
+    async def stop(self):
         """
         Irreversibly stop the sender.
         """
@@ -219,7 +231,7 @@ class RTCRtpSender:
             self.__rtcp_task.cancel()
             await asyncio.gather(self.__rtp_exited.wait(), self.__rtcp_exited.wait())
 
-    async def _handle_rtcp_packet(self, packet) -> None:
+    async def _handle_rtcp_packet(self, packet):
         if isinstance(packet, (RtcpRrPacket, RtcpSrPacket)):
             for report in filter(lambda x: x.ssrc == self._ssrc, packet.reports):
                 # estimate round-trip time
@@ -269,33 +281,41 @@ class RTCRtpSender:
     async def _next_encoded_frame(
         self, codec: RTCRtpCodecParameters
     ) -> Optional[RTCEncodedFrame]:
-        # Get [Frame|Packet].
-        data = await self.__track.recv()
-
         # If the sender is disabled, drop the frame instead of encoding it.
         # We still want to read from the track in order to avoid frames
         # accumulating in memory.
         if not self._enabled:
+            data = await self.__track.recv()
             return None
 
         audio_level = None
+        payloads = None
 
         if self.__encoder is None:
             self.__encoder = get_encoder(codec)
 
-        if isinstance(data, Frame):
-            # Encode the frame.
-            if isinstance(data, AudioFrame):
-                audio_level = rtp.compute_audio_level_dbov(data)
-
-            force_keyframe = self.__force_keyframe
-            self.__force_keyframe = False
-            payloads, timestamp = await self.__loop.run_in_executor(
-                None, self.__encoder.encode, data, force_keyframe
-            )
+        # Check if the track is pre-encoded
+        if isinstance(self.__track, EncodedMediaStreamTrack):
+            # Frames come already encoded from the MediaStreamTrack
+            data = await self.__track.recv()
+            if data:
+                payloads, timestamp = data
         else:
-            # Pack the pre-encoded data.
-            payloads, timestamp = self.__encoder.pack(data)
+            # Get raw frame and encode it
+            data = await self.__track.recv()
+            if isinstance(data, Frame):
+                # Encode the frame.
+                if isinstance(data, AudioFrame):
+                    audio_level = rtp.compute_audio_level_dbov(data)
+
+                force_keyframe = self.__force_keyframe
+                self.__force_keyframe = False
+                payloads, timestamp = await self.__loop.run_in_executor(
+                    None, self.__encoder.encode, data, force_keyframe
+                )
+            else:
+                # Pack the pre-encoded data.
+                payloads, timestamp = self.__encoder.pack(data)
 
         # If the encoder did not return any payloads, return `None`.
         # This may be due to a delay caused by resampling.
